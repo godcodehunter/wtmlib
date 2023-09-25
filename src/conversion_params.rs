@@ -434,66 +434,6 @@ impl ConversionParams {
         Ok(conv_params)
     }
 
-    /// Calculate time (in seconds!) before the earliest TSC wrap
-    ///
-    /// All available CPUs are considered when calculating the time
-    pub fn time_before_tsc_wrap(&self) -> Result<u64, anyhow::Error> {
-        unsafe {
-            println!("Calculating time before the earliest TSC wrap...");
-        
-            let mut ps_state = ProcAndSysState::default();
-            let mut max_tsc_val = Timestamp(0);
-            let mut curr_tsc_val;
-            let secs_before_wrap;
-            get_proc_and_system_state(&mut ps_state)
-                .context("Couldn't obtain details of the system and process state")?;
-            
-            let cpu_id = -1;
-            let thread_self = std::thread::current().id().as_u64().get();
-            let cpu_set_size = libc::CPU_ALLOC_SIZE(ps_state.num_cpus);
-            let cpu_set = libc_miss::CPU_ALLOC(ps_state.num_cpus);
-
-            libc_miss::CPU_ZERO_S(cpu_set_size, cpu_set);
-            
-            for cpu_id in 0..ps_state.num_cpus {
-                if libc_miss::CPU_ISSET_S( cpu_id, cpu_set_size, ps_state.initial_cpu_set) == 0 {
-                    continue; 
-                }     
-
-                libc_miss::CPU_SET_S(cpu_id, cpu_set_size, cpu_set);
-
-                if libc::pthread_setaffinity_np(thread_self, cpu_set_size, cpu_set) != 0 {
-                    libc_miss::CPU_FREE(cpu_set);
-                    bail!("Couldn't change CPU affinity of the current thread");
-                }
-
-                curr_tsc_val = get_tsc();
-                println!("TSC on CPU {}: {}", cpu_id, curr_tsc_val.0);
-
-                if curr_tsc_val.0 > max_tsc_val.0 {
-                    max_tsc_val = curr_tsc_val;
-                }
-
-                /* Return CPU mask to the "clean" state */
-                libc_miss::CPU_CLR_S( cpu_id, cpu_set_size, cpu_set);
-            }
-            
-            libc_miss::CPU_FREE(cpu_set);
-
-            println!("The maximum TSC value: {}", max_tsc_val.0);
-            secs_before_wrap = self.convert_to_nanosec(Timestamp(u64::MAX - max_tsc_val.0)) / 1000000000;
-            println!("Seconds before the maximum TSC will wrap: {}", secs_before_wrap);
-            
-            // This error is not critical. But we do treat it as critical. See
-            // the detailed comment to the identical condition inside
-            // "inspect_cpu_switching" function
-            restore_initial_proc_state(&ps_state)
-                .context("Couldn't restore initial state of the current process")?;
-
-            Ok(secs_before_wrap)
-        }
-    }
-
     /// Convert TSC ticks to nanoseconds
     /// 
     /// REALLY IMPORTANT: for the conversion to be fast, it must be ensured that the
@@ -502,4 +442,64 @@ impl ConversionParams {
         (ticks.0 >> self.tsc_remainder_length) * self.nsecs_per_tsc_modulus
         + ((ticks.0 & self.tsc_remainder_bitmask) * (self.mult) >> self.shift)
     }
+}
+
+/// Calculate time (in seconds!) before the earliest TSC wrap
+///
+/// All available CPUs are considered when calculating the time
+pub fn time_before_tsc_wrap(cp: &ConversionParams) -> Result<u64, anyhow::Error> {
+unsafe {
+    println!("Calculating time before the earliest TSC wrap...");
+
+    let mut ps_state = ProcAndSysState::default();
+    let mut max_tsc_val = Timestamp(0);
+    let mut curr_tsc_val;
+    let secs_before_wrap;
+    get_proc_and_system_state(&mut ps_state)
+        .context("Couldn't obtain details of the system and process state")?;
+    
+    let cpu_id = -1;
+    let thread_self = std::thread::current().id().as_u64().get();
+    let cpu_set_size = libc::CPU_ALLOC_SIZE(ps_state.num_cpus);
+    let cpu_set = libc_miss::CPU_ALLOC(ps_state.num_cpus);
+
+    libc_miss::CPU_ZERO_S(cpu_set_size, cpu_set);
+    
+    for cpu_id in 0..ps_state.num_cpus {
+        if libc_miss::CPU_ISSET_S( cpu_id, cpu_set_size, ps_state.initial_cpu_set) == 0 {
+            continue; 
+        }     
+
+        libc_miss::CPU_SET_S(cpu_id, cpu_set_size, cpu_set);
+
+        if libc::pthread_setaffinity_np(thread_self, cpu_set_size, cpu_set) != 0 {
+            libc_miss::CPU_FREE(cpu_set);
+            bail!("Couldn't change CPU affinity of the current thread");
+        }
+
+        curr_tsc_val = get_tsc();
+        println!("TSC on CPU {}: {}", cpu_id, curr_tsc_val.0);
+
+        if curr_tsc_val.0 > max_tsc_val.0 {
+            max_tsc_val = curr_tsc_val;
+        }
+
+        /* Return CPU mask to the "clean" state */
+        libc_miss::CPU_CLR_S( cpu_id, cpu_set_size, cpu_set);
+    }
+    
+    libc_miss::CPU_FREE(cpu_set);
+
+    println!("The maximum TSC value: {}", max_tsc_val.0);
+    secs_before_wrap = cp.convert_to_nanosec(Timestamp(u64::MAX - max_tsc_val.0)) / 1000000000;
+    println!("Seconds before the maximum TSC will wrap: {}", secs_before_wrap);
+    
+    // This error is not critical. But we do treat it as critical. See
+    // the detailed comment to the identical condition inside
+    // "inspect_cpu_switching" function
+    restore_initial_proc_state(&ps_state)
+        .context("Couldn't restore initial state of the current process")?;
+
+    Ok(secs_before_wrap)
+}
 }
