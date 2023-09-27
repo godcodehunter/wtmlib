@@ -352,7 +352,7 @@ impl ConversionParams {
             s += delta * (*sample as f64 - mean)
         }
 
-        let sigma = 0.0;
+        let mut sigma = 0.0;
         let mut max_sample: u64 = 0;
         let mut min_sample: u64 = u64::MAX;
         let mut num_good_samples = 0;
@@ -360,7 +360,7 @@ impl ConversionParams {
 
         // We use "corrected sample standard deviation" here, and thus, "S" is divided
         // not by the number of samples but by the number of samples minus 1 
-        let sigma = if samples.len() > 1 {
+        sigma = if samples.len() > 1 {
             (s / (samples.len() as f64 - 1.0)).sqrt()
         } else {
             s.sqrt()
