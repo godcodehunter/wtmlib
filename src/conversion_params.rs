@@ -451,26 +451,29 @@ pub fn time_before_tsc_wrap(cp: &ConversionParams) -> Result<u64, anyhow::Error>
 unsafe {
     println!("Calculating time before the earliest TSC wrap...");
 
-    let mut ps_state = ProcAndSysState::default();
     let mut max_tsc_val = Timestamp(0);
     let mut curr_tsc_val;
     let secs_before_wrap;
-    get_proc_and_system_state(&mut ps_state)
+    let mut ps_state = ProcAndSysState::new()
         .context("Couldn't obtain details of the system and process state")?;
     
     let cpu_id = -1;
     let thread_self = std::thread::current().id().as_u64().get();
-    let cpu_set_size = libc::CPU_ALLOC_SIZE(ps_state.num_cpus);
-    let cpu_set = libc_miss::CPU_ALLOC(ps_state.num_cpus);
+    let cpu_set_size = libc::CPU_ALLOC_SIZE(ps_state.initial_cpu_set.len() as i32);
+    let cpu_set = libc_miss::CPU_ALLOC(ps_state.initial_cpu_set.len() as i32);
 
     libc_miss::CPU_ZERO_S(cpu_set_size, cpu_set);
     
-    for cpu_id in 0..ps_state.num_cpus {
-        if libc_miss::CPU_ISSET_S( cpu_id, cpu_set_size, ps_state.initial_cpu_set) == 0 {
+    for cpu_id in 0..ps_state.initial_cpu_set.len() {
+        if libc_miss::CPU_ISSET_S( 
+            cpu_id as i32, 
+            cpu_set_size, 
+            ps_state.initial_cpu_set.as_mut_ptr()
+        ) == 0 {
             continue; 
         }     
 
-        libc_miss::CPU_SET_S(cpu_id, cpu_set_size, cpu_set);
+        libc_miss::CPU_SET_S(cpu_id as i32, cpu_set_size, cpu_set);
 
         if libc::pthread_setaffinity_np(thread_self, cpu_set_size, cpu_set) != 0 {
             libc_miss::CPU_FREE(cpu_set);
@@ -485,7 +488,7 @@ unsafe {
         }
 
         /* Return CPU mask to the "clean" state */
-        libc_miss::CPU_CLR_S( cpu_id, cpu_set_size, cpu_set);
+        libc_miss::CPU_CLR_S( cpu_id as i32, cpu_set_size, cpu_set);
     }
     
     libc_miss::CPU_FREE(cpu_set);
