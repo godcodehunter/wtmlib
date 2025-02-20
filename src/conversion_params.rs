@@ -440,6 +440,7 @@ impl ConversionParams {
     /// 
     /// REALLY IMPORTANT: for the conversion to be fast, it must be ensured that the
     /// structure with the conversion parameters always stays in cache
+    #[inline]
     pub fn convert_to_nanosec(&self, ticks: Timestamp) -> u64 {
         (ticks.0 >> self.tsc_remainder_length) * self.nsecs_per_tsc_modulus
         + ((ticks.0 & self.tsc_remainder_bitmask) * (self.mult) >> self.shift)

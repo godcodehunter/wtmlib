@@ -14,6 +14,7 @@ pub struct Timestamp(u64);
 
 /// Get time-stamp counter
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
 pub fn get_tsc() -> Timestamp {
     unsafe {
         use std::arch::x86_64::_rdtsc;
@@ -239,11 +240,16 @@ pub fn inspect_cpu_switching() -> Result<CpuSwitchingEstimate, anyhow::Error> {
     let mut ps_state = ProcAndSysState::new()
         .context("Couldn't obtain details of the system and process state")?;
     
-    calc_tsc_enclosing_range_cpu_switch()
+    let tsc_range_length = calc_tsc_enclosing_range_cpu_switch()
         .context("Error while calculating enclosing TSC range")?;
     
-    eval_tsc_monotonicity_cpu_switch()
+    let is_monotonic = eval_tsc_monotonicity_cpu_switch()
         .context("Error while evaluating TSC monotonicity")?;
+
+    Ok(CpuSwitchingEstimate {
+        tsc_range_length,
+        is_monotonic,
+    })
 }
 
 

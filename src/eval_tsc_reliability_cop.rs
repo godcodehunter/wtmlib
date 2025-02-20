@@ -644,14 +644,14 @@ fn eval_tsc_monotonicity_cop(
 
 pub struct CpuSwitchingEstimate {
     /// Estimated maximum shift between TSC counters running on different CPUs
-    tsc_range_length: i64,
+    pub tsc_range_length: i64,
     /// Whether TSC values measured successively on same or different CPUs
     /// monotonically increase. If the function sets (*is_monotonic) to
     /// "false", that doesn't necessarily imply that TSCs are unreliable.
     /// In rare cases the observed non-monotonicity may be a result of TSC
     /// wrap that occured on one/several CPUs right before or just in the
     /// middle of the computations
-    is_monotonic: bool,
+    pub is_monotonic: bool,
 }
 
 /// Evaluate reliability of TSC (the required data is collected using a method of
