@@ -1,3 +1,5 @@
+PROJECT IN PROGRESS - NOT FOR USE
+
 # Wall-clock Time Measurement library (WTMLIB)
 
 <sup> Port with some modification of the [WTMLIB](https://github.com/AndreyNevolin/wtmlib).</sup>\
