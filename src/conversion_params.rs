@@ -178,7 +178,7 @@ impl ConversionParams {
             shift += 1;
         }
         
-        let factor = (1 as u64) << shift;
+        let factor = 1 << shift;
         // Cannot get overflow here. By calculation this value is smaller than mult_bound 
         let mult = factor * 1000000000 / tsc_per_sec;
 
@@ -190,10 +190,12 @@ impl ConversionParams {
         let mut tsc_remainder_length = 0;
 
         while (tsc_worth_of_modulus >> tsc_remainder_length) > 1 {
-            tsc_remainder_length+=1;
+            tsc_remainder_length += 1;
         }
 
-        let tsc_modulus = (1 as u64) << tsc_remainder_length;
+        println!("Length of TSC remainder in bits: {}", tsc_remainder_length);
+
+        let tsc_modulus = 1 << tsc_remainder_length;
 
         // Here we could use (tsc_modulus * 1000000000) / tsc_per_sec. But in this case the
         // nanosecond worth of the last tick of every TSC modulus period would be excessively
@@ -250,7 +252,7 @@ impl ConversionParams {
             end_tsc_val = get_tsc();
 
             if (end_time - start_time).as_nanos() 
-                > (time_period_usecs * 1000) as u128 
+                < (time_period_usecs * 1000) as u128 
             { 
                     break; 
             }
@@ -269,8 +271,9 @@ impl ConversionParams {
         // Well, the difference may be big not only because of TSC inconsistency but also
         // because the elapsed time period is indeed very long. Nevertheless, we assume
         // here that configuration parameters of the library are within "sane" bounds
-        if u64::MAX / 1000000000 < end_tsc_val.0 - start_tsc_val.0 {
-            bail!("Difference between end and start TSC values is too big (%lu)");
+        let diff = end_tsc_val.0 - start_tsc_val.0;
+        if u64::MAX / 1000000000 < diff {
+            bail!("Difference between end and start TSC values is too big ({})", diff);
         }
 
         let res = (end_tsc_val.0 - start_tsc_val.0) * 1000000000 / (end_time - start_time).as_nanos() as u64;
@@ -403,8 +406,7 @@ impl ConversionParams {
     }
 
     /// Calculate parameters needed to perform fast and accurate conversion of 
-    /// TSC ticks to nanoseconds. Also calculate time (in seconds) remaining 
-    /// before the earliest TSC wrap
+    /// TSC ticks to nanoseconds.
     pub fn new() -> Result<ConversionParams, anyhow::Error> {
         println!("Calculating TSC-to-nanoseconds conversion parameters...");
         
@@ -442,67 +444,57 @@ impl ConversionParams {
         (ticks.0 >> self.tsc_remainder_length) * self.nsecs_per_tsc_modulus
         + ((ticks.0 & self.tsc_remainder_bitmask) * (self.mult) >> self.shift)
     }
-}
 
-/// Calculate time (in seconds!) before the earliest TSC wrap
-///
-/// All available CPUs are considered when calculating the time
-pub fn time_before_tsc_wrap(cp: &ConversionParams) -> Result<u64, anyhow::Error> {
-unsafe {
-    println!("Calculating time before the earliest TSC wrap...");
-
-    let mut max_tsc_val = Timestamp(0);
-    let mut curr_tsc_val;
-    let secs_before_wrap;
-    let mut ps_state = ProcAndSysState::new()
-        .context("Couldn't obtain details of the system and process state")?;
+    /// Calculate time (in seconds!) before the earliest TSC wrap
+    /// 
+    /// TSC wrap - counter overflow, that is when the value reaches its maximum 
+    /// and starts counting from zero
+    /// 
+    /// All available CPUs are considered when calculating the time
+    pub fn time_before_tsc_wrap(&self) -> Result<u64, anyhow::Error> {
+    unsafe {
+        println!("Calculating time before the earliest TSC wrap...");
     
-    let cpu_id = -1;
-    let thread_self = std::thread::current().id().as_u64().get();
-    let cpu_set_size = libc::CPU_ALLOC_SIZE(ps_state.initial_cpu_set.len() as i32);
-    let cpu_set = libc_miss::CPU_ALLOC(ps_state.initial_cpu_set.len() as i32);
-
-    libc_miss::CPU_ZERO_S(cpu_set_size, cpu_set);
+        let mut max_tsc_val = Timestamp(0);
+        let mut curr_tsc_val;
+        let secs_before_wrap;
+        let mut ps_state = ProcAndSysState::new()
+            .context("Couldn't obtain details of the system and process state")?;
+        
+        let thread_self = std::thread::current().id().as_u64().get();
+        let cpu_set_size = libc::CPU_ALLOC_SIZE(ps_state.num_cpus);
+        let mut cpu_set = std::mem::MaybeUninit::zeroed().assume_init();
+         
+        for cpu_id in 0..ps_state.num_cpus as usize {
+            if !libc::CPU_ISSET( 
+                cpu_id, 
+                &mut ps_state.initial_cpu_set
+            ) {
+                continue; 
+            }     
     
-    for cpu_id in 0..ps_state.initial_cpu_set.len() {
-        if libc_miss::CPU_ISSET_S( 
-            cpu_id as i32, 
-            cpu_set_size, 
-            ps_state.initial_cpu_set.as_mut_ptr()
-        ) == 0 {
-            continue; 
-        }     
-
-        libc_miss::CPU_SET_S(cpu_id as i32, cpu_set_size, cpu_set);
-
-        if libc::pthread_setaffinity_np(thread_self, cpu_set_size, cpu_set) != 0 {
-            libc_miss::CPU_FREE(cpu_set);
-            bail!("Couldn't change CPU affinity of the current thread");
+            libc::CPU_SET(cpu_id, &mut cpu_set);
+    
+            if libc::pthread_setaffinity_np(thread_self, cpu_set_size, &cpu_set) != 0 {
+                bail!("Couldn't change CPU affinity of the current thread");
+            }
+    
+            curr_tsc_val = get_tsc();
+            println!("TSC on CPU {}: {}", cpu_id, curr_tsc_val.0);
+    
+            if curr_tsc_val.0 > max_tsc_val.0 {
+                max_tsc_val = curr_tsc_val;
+            }
+    
+            /* Return CPU mask to the "clean" state */
+            libc::CPU_CLR(cpu_id, &mut cpu_set);
         }
-
-        curr_tsc_val = get_tsc();
-        println!("TSC on CPU {}: {}", cpu_id, curr_tsc_val.0);
-
-        if curr_tsc_val.0 > max_tsc_val.0 {
-            max_tsc_val = curr_tsc_val;
-        }
-
-        /* Return CPU mask to the "clean" state */
-        libc_miss::CPU_CLR_S( cpu_id as i32, cpu_set_size, cpu_set);
+        
+        println!("The maximum TSC value: {}", max_tsc_val.0);
+        secs_before_wrap = self.convert_to_nanosec(Timestamp(u64::MAX - max_tsc_val.0)) / 1000000000;
+        println!("Seconds before the maximum TSC will wrap: {}", secs_before_wrap);
+            
+        Ok(secs_before_wrap)
     }
-    
-    libc_miss::CPU_FREE(cpu_set);
-
-    println!("The maximum TSC value: {}", max_tsc_val.0);
-    secs_before_wrap = cp.convert_to_nanosec(Timestamp(u64::MAX - max_tsc_val.0)) / 1000000000;
-    println!("Seconds before the maximum TSC will wrap: {}", secs_before_wrap);
-    
-    // This error is not critical. But we do treat it as critical. See
-    // the detailed comment to the identical condition inside
-    // "inspect_cpu_switching" function
-    restore_initial_proc_state(&ps_state)
-        .context("Couldn't restore initial state of the current process")?;
-
-    Ok(secs_before_wrap)
-}
+    }
 }

@@ -7,4 +7,5 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
-libc = "0.2.148"
+casclib = "0.0.0-dev"
+libc = "0.2.169"
