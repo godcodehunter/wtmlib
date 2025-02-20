@@ -142,7 +142,6 @@ impl Drop for ProcAndSysState {
             let cpu_set_size = libc::CPU_ALLOC_SIZE( self.num_cpus);
             let cpu_set = std::mem::MaybeUninit::zeroed().assume_init();
     
-            todo!();
             libc::CPU_SET(self.initial_cpu_id, cpu_set);
     
             if libc::pthread_setaffinity_np(thread_self, cpu_set_size, cpu_set) != 0 {
