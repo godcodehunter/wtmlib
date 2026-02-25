@@ -1,4 +1,5 @@
-/// This module contains configuration parameters for the library
+//! This module contains configuration parameters for the library
+#![allow(dead_code)]
 
 /// A number of "round trips" that the current thread should make across
 /// available CPUs when calculating enclosing TSC range

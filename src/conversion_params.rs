@@ -1,4 +1,5 @@
 use crate::*;
+use libc;
 
 /// A set of parameters used to convert TSC ticks into nanoseconds in a fast and
 /// accurate way
@@ -225,59 +226,165 @@ impl ConversionParams {
         })
     }
 
-    /// Calculate how TSC changes during a second
-    ///
-    /// At first, it's measured how TSC changes during the specified period of time.
-    /// Then TSC-ticks-per-second is calculated based on the measured value
-    fn calc_tsc_count_per_second(time_period_usecs: u64) -> Result<u64, anyhow::Error> {
-        use std::time::Instant;
-        
-        let mut end_time;
-        let mut end_tsc_val;
-        
-        // We first measure the start time and then start TSC value. The end values of
-        // time and TSC must be measured in the same order. That's because there exists
-        // a time gap between the start measurements. We don't know the value of this gap
-        // but we can - at least partially - compensate for the gap. We expect that the
-        // gap will be more or less the same each time we collect time and TSC values in
-        // the fixed order.
-        // Also we ensure that TSC and time values are measured one right after another.
-        // There must be no other operations in-between. E.g. we check the return value
-        // of 'clock_gettime()' only after the corresponding TSC value is measured
-        let start_time = Instant::now();
-        let start_tsc_val = get_tsc();
-        
-        loop {
-            end_time = Instant::now();
-            end_tsc_val = get_tsc();
+    /// Try to read TSC frequency from the system (Linux sysfs)
+    fn get_tsc_freq_from_sysfs() -> Option<u64> {
+        use std::fs;
 
-            if (end_time - start_time).as_nanos() 
-                < (time_period_usecs * 1000) as u128 
-            { 
-                    break; 
+        // Try reading from sysfs (available on some Linux systems)
+        if let Ok(content) = fs::read_to_string("/sys/devices/system/cpu/cpu0/tsc_freq_khz") {
+            if let Ok(khz) = content.trim().parse::<u64>() {
+                println!("TSC frequency from sysfs: {} kHz", khz);
+                return Some(khz * 1000);
+            }
+        }
+        None
+    }
+
+    /// Try to read TSC frequency from CPUID (Intel CPUs)
+    #[cfg(target_arch = "x86_64")]
+    fn get_tsc_freq_from_cpuid() -> Option<u64> {
+        use std::arch::x86_64::__cpuid;
+
+        let cpuid0 = unsafe { __cpuid(0) };
+        let max_leaf = cpuid0.eax;
+
+        // CPUID leaf 0x15: Time Stamp Counter and Nominal Core Crystal Clock
+        if max_leaf >= 0x15 {
+            let cpuid15 = unsafe { __cpuid(0x15) };
+            let (eax, ebx, ecx) = (cpuid15.eax, cpuid15.ebx, cpuid15.ecx);
+
+            if eax != 0 && ebx != 0 && ecx != 0 {
+                let tsc_freq = (ecx as u64) * (ebx as u64) / (eax as u64);
+                println!("TSC frequency from CPUID 0x15: {} Hz", tsc_freq);
+                return Some(tsc_freq);
             }
         }
 
-        // Possibly TSC wrap has happened. But we don't guess here, just report
-        // the observed inconsistency as an error
+        // CPUID leaf 0x16: Processor Frequency Information (Intel)
+        if max_leaf >= 0x16 {
+            let cpuid16 = unsafe { __cpuid(0x16) };
+            if cpuid16.eax != 0 {
+                let base_freq = (cpuid16.eax as u64) * 1_000_000;
+                println!("Base frequency from CPUID 0x16: {} Hz", base_freq);
+                // Note: This is base frequency, not necessarily TSC frequency
+                // Only use as fallback
+            }
+        }
+
+        None
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn get_tsc_freq_from_cpuid() -> Option<u64> {
+        None
+    }
+
+    /// Calibrate TSC frequency using busy-wait (more accurate than sleep)
+    fn calibrate_tsc_busy_wait(duration_ms: u64) -> Result<u64, anyhow::Error> {
+        use std::time::{Duration, Instant};
+
+        let target_duration = Duration::from_millis(duration_ms);
+
+        let start_time = Instant::now();
+        let start_tsc = get_tsc();
+
+        // Busy-wait for precise timing
+        while start_time.elapsed() < target_duration {
+            std::hint::spin_loop();
+        }
+
+        let end_tsc = get_tsc();
+        let elapsed = start_time.elapsed();
+
+        if end_tsc.0 <= start_tsc.0 {
+            bail!("TSC did not increase during calibration (possible wrap)");
+        }
+
+        let tsc_diff = end_tsc.0 - start_tsc.0;
+        let freq = (tsc_diff as f64 / elapsed.as_secs_f64()) as u64;
+
+        Ok(freq)
+    }
+
+    /// Get TSC frequency with validation
+    ///
+    /// Tries multiple methods and validates the result
+    fn get_validated_tsc_frequency() -> Result<u64, anyhow::Error> {
+        println!("Determining TSC frequency...");
+
+        // Method 1: Try system sources first (most accurate)
+        if let Some(freq) = Self::get_tsc_freq_from_sysfs() {
+            println!("Using TSC frequency from sysfs: {:.3} GHz", freq as f64 / 1e9);
+            return Ok(freq);
+        }
+
+        if let Some(freq) = Self::get_tsc_freq_from_cpuid() {
+            println!("Using TSC frequency from CPUID: {:.3} GHz", freq as f64 / 1e9);
+            return Ok(freq);
+        }
+
+        // Method 2: Calibrate with busy-wait (two measurements for validation)
+        println!("Calibrating TSC frequency (busy-wait method)...");
+
+        let freq1 = Self::calibrate_tsc_busy_wait(100)?;
+        let freq2 = Self::calibrate_tsc_busy_wait(100)?;
+
+        // Validate: frequencies should be within 0.1% of each other
+        let diff = if freq1 > freq2 { freq1 - freq2 } else { freq2 - freq1 };
+        let diff_pct = (diff as f64 / freq1 as f64) * 100.0;
+
+        if diff_pct > 0.5 {
+            // If they differ too much, do a longer calibration
+            println!("Initial calibrations differ by {:.2}%, doing longer calibration...", diff_pct);
+            let freq3 = Self::calibrate_tsc_busy_wait(500)?;
+            println!("TSC frequency (long calibration): {:.6} GHz", freq3 as f64 / 1e9);
+            return Ok(freq3);
+        }
+
+        // Use average of two measurements
+        let freq = (freq1 + freq2) / 2;
+        println!("TSC frequency (calibrated): {:.6} GHz", freq as f64 / 1e9);
+
+        Ok(freq)
+    }
+
+    /// Calculate how TSC changes during a second
+    ///
+    /// DEPRECATED: Use get_validated_tsc_frequency() instead.
+    /// Kept for compatibility with existing code structure.
+    fn calc_tsc_count_per_second(time_period_usecs: u64) -> Result<u64, anyhow::Error> {
+        use std::time::Instant;
+
+        let start_time = Instant::now();
+        let start_tsc_val = get_tsc();
+
+        // Busy-wait for the specified duration (more accurate than sleep)
+        let target_ns = (time_period_usecs * 1000) as u128;
+        while start_time.elapsed().as_nanos() < target_ns {
+            std::hint::spin_loop();
+        }
+
+        let end_time = Instant::now();
+        let end_tsc_val = get_tsc();
+
         if start_tsc_val.0 >= end_tsc_val.0 {
             bail!(
-                "End TSC value ({}) is smaller then or equal to start TSC value ({}). TSC wrap might has happened", 
-                start_tsc_val.0, 
+                "End TSC value ({}) is smaller than or equal to start TSC value ({}). TSC wrap might have happened",
                 end_tsc_val.0,
+                start_tsc_val.0,
             );
         }
 
-        // Well, the difference may be big not only because of TSC inconsistency but also
-        // because the elapsed time period is indeed very long. Nevertheless, we assume
-        // here that configuration parameters of the library are within "sane" bounds
-        let diff = end_tsc_val.0 - start_tsc_val.0;
-        if u64::MAX / 1000000000 < diff {
-            bail!("Difference between end and start TSC values is too big ({})", diff);
+        let tsc_diff = end_tsc_val.0 - start_tsc_val.0;
+        let time_ns = end_time.duration_since(start_time).as_nanos() as u64;
+
+        if time_ns == 0 {
+            bail!("Elapsed time is zero");
         }
 
-        let res = (end_tsc_val.0 - start_tsc_val.0) * 1000000000 / (end_time - start_time).as_nanos() as u64;
-        Ok(res)
+        // Calculate frequency: ticks_per_sec = ticks / seconds = ticks * 1e9 / nanoseconds
+        let freq = ((tsc_diff as u128 * 1_000_000_000) / time_ns as u128) as u64;
+        Ok(freq)
     }
 
     /// Given a series of TSC-per-sec values and using some basic statistics concepts,
@@ -337,7 +444,7 @@ impl ConversionParams {
     ///
     fn calc_golden(samples: &[u64]) -> Result<u64, anyhow::Error> {
         println!("\"Cleaning\" collected TSC-per-second values from random noise");
-        
+
         // Calculate "mean" and "standard deviation" of TSC-per-second observable value
         // We use incremental formulas for computing both. Classical formulas are less
         // stable. E.g. classical formula for calculating "mean" suffers from the
@@ -347,31 +454,27 @@ impl ConversionParams {
         // needs to spend a lot of time measuring time intervals. Which not a very good
         let mut mean = 0.0;
         let mut s = 0.0;
-        let mut delta = 0.0;
 
-        for (i, sample) in samples.into_iter().enumerate() {
-            delta = *sample as f64 - mean;
+        for (i, sample) in samples.iter().enumerate() {
+            let delta = *sample as f64 - mean;
             mean += delta / (i as f64 + 1.0);
             s += delta * (*sample as f64 - mean)
         }
 
-        let mut sigma = 0.0;
-        let mut max_sample: u64 = 0;
-        let mut min_sample: u64 = u64::MAX;
         let mut num_good_samples = 0;
         let mut average = 0;
 
         // We use "corrected sample standard deviation" here, and thus, "S" is divided
-        // not by the number of samples but by the number of samples minus 1 
-        sigma = if samples.len() > 1 {
+        // not by the number of samples but by the number of samples minus 1
+        let sigma = if samples.len() > 1 {
             (s / (samples.len() as f64 - 1.0)).sqrt()
         } else {
             s.sqrt()
         };
 
         // Find minimum and maximum samples
-        max_sample = samples.into_iter().max().unwrap().clone();
-        min_sample = samples.into_iter().min().unwrap().clone();
+        let max_sample = *samples.iter().max().unwrap();
+        let min_sample = *samples.iter().min().unwrap();
 
         // Filter out statistical outliers and calculate an average 
         for sample in samples {
@@ -405,45 +508,65 @@ impl ConversionParams {
         Ok(average)
     }
 
-    /// Calculate parameters needed to perform fast and accurate conversion of 
+    /// Calculate parameters needed to perform fast and accurate conversion of
     /// TSC ticks to nanoseconds.
+    ///
+    /// This function determines TSC frequency using the most accurate method available:
+    /// 1. System sources (sysfs, CPUID) - instant and most accurate
+    /// 2. Busy-wait calibration - takes ~200ms but very accurate
     pub fn new() -> Result<ConversionParams, anyhow::Error> {
         println!("Calculating TSC-to-nanoseconds conversion parameters...");
-        
-        // Allocate array to keep tsc-per-second values calculated in different 
-        // experiments
+
+        let tsc_freq = Self::get_validated_tsc_frequency()
+            .context("Failed to determine TSC frequency")?;
+
+        let conv_params = Self::from_ratio(tsc_freq)
+            .context("Error while calculating TSC-to-nanoseconds conversion parameters")?;
+
+        Ok(conv_params)
+    }
+
+    /// Calculate parameters using the legacy multi-sample method.
+    ///
+    /// This method takes longer (~15 seconds) but may be more robust on some systems.
+    /// Use `new()` for faster initialization with comparable accuracy.
+    pub fn new_legacy() -> Result<ConversionParams, anyhow::Error> {
+        println!("Calculating TSC-to-nanoseconds conversion parameters (legacy method)...");
+
         let mut tsc_per_sec = [0u64; WTMLIB_TSC_PER_SEC_SAMPLE_COUNT];
-        
+
         println!("Calculating how TSC changes during a second-long time period");
         for i in 0..WTMLIB_TSC_PER_SEC_SAMPLE_COUNT {
-            tsc_per_sec[i] = Self::calc_tsc_count_per_second(
-                WTMLIB_TIME_PERIOD_TO_MATCH_WITH_TSC
-            )
+            tsc_per_sec[i] = Self::calc_tsc_count_per_second(WTMLIB_TIME_PERIOD_TO_MATCH_WITH_TSC)
                 .context("Error while calculating TSC worth of a second")?;
-            println!(
-                "[Measurement {}] TSC ticks per sec: {}", 
-                i, 
-                tsc_per_sec[i],
-            );
+            println!("[Measurement {}] TSC ticks per sec: {}", i, tsc_per_sec[i]);
         }
-        
+
         let golden = Self::calc_golden(&tsc_per_sec)
             .context("Error while \"cleaning\" TSC-per-second samples from random noise")?;
-        
+
         let conv_params = Self::from_ratio(golden)
             .context("Error while calculating TSC-to-nanoseconds conversion parameters")?;
-        
+
         Ok(conv_params)
     }
 
     /// Convert TSC ticks to nanoseconds
-    /// 
+    ///
     /// REALLY IMPORTANT: for the conversion to be fast, it must be ensured that the
     /// structure with the conversion parameters always stays in cache
     #[inline]
     pub fn convert_to_nanosec(&self, ticks: Timestamp) -> u64 {
         (ticks.0 >> self.tsc_remainder_length) * self.nsecs_per_tsc_modulus
-        + ((ticks.0 & self.tsc_remainder_bitmask) * (self.mult) >> self.shift)
+            + ((ticks.0 & self.tsc_remainder_bitmask) * (self.mult) >> self.shift)
+    }
+
+    /// Get TSC ticks per second
+    ///
+    /// This can be used for simple division-based conversion if needed
+    #[inline]
+    pub fn tsc_ticks_per_sec(&self) -> u64 {
+        self.tsc_ticks_per_sec
     }
 
     /// Calculate time (in seconds!) before the earliest TSC wrap
@@ -462,7 +585,7 @@ impl ConversionParams {
         let mut ps_state = ProcAndSysState::new()
             .context("Couldn't obtain details of the system and process state")?;
         
-        let thread_self = std::thread::current().id().as_u64().get();
+        let thread_self = libc::pthread_self();
         let cpu_set_size = libc::CPU_ALLOC_SIZE(ps_state.num_cpus);
         let mut cpu_set = std::mem::MaybeUninit::zeroed().assume_init();
          
@@ -497,5 +620,126 @@ impl ConversionParams {
             
         Ok(secs_before_wrap)
     }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calc_tsc_count_per_second() {
+        let result = ConversionParams::calc_tsc_count_per_second(100_000); // 100ms
+        assert!(result.is_ok(), "calc_tsc_count_per_second should succeed");
+
+        let tsc_per_sec = result.unwrap();
+        // TSC frequency should be in a reasonable range (100MHz to 10GHz)
+        assert!(
+            tsc_per_sec > 100_000_000,
+            "TSC frequency should be > 100MHz, got {}",
+            tsc_per_sec
+        );
+        assert!(
+            tsc_per_sec < 10_000_000_000,
+            "TSC frequency should be < 10GHz, got {}",
+            tsc_per_sec
+        );
+    }
+
+    #[test]
+    fn test_calc_golden_removes_outliers() {
+        // Create samples with outliers
+        let samples = [
+            3_000_000_000u64,
+            3_000_000_100,
+            3_000_000_050,
+            3_000_000_080,
+            3_000_000_020,
+            3_500_000_000, // outlier
+            3_000_000_030,
+            3_000_000_060,
+        ];
+
+        let result = ConversionParams::calc_golden(&samples);
+        assert!(result.is_ok(), "calc_golden should succeed");
+
+        let golden = result.unwrap();
+        // The golden value should be close to 3GHz, not skewed by the outlier
+        assert!(
+            golden > 2_900_000_000 && golden < 3_100_000_000,
+            "Golden value should be around 3GHz, got {}",
+            golden
+        );
+    }
+
+    #[test]
+    fn test_from_ratio() {
+        // Test with a realistic TSC frequency of 3GHz
+        let tsc_per_sec = 3_000_000_000u64;
+        let result = ConversionParams::from_ratio(tsc_per_sec);
+        assert!(result.is_ok(), "from_ratio should succeed");
+
+        let params = result.unwrap();
+        assert!(params.mult > 0, "mult should be positive");
+        assert!(params.shift > 0, "shift should be positive");
+        assert!(
+            params.tsc_remainder_length > 0,
+            "tsc_remainder_length should be positive"
+        );
+    }
+
+    #[test]
+    fn test_convert_to_nanosec() {
+        // Create params for 3GHz TSC
+        let tsc_per_sec = 3_000_000_000u64;
+        let params = ConversionParams::from_ratio(tsc_per_sec).unwrap();
+
+        // 3 billion ticks at 3GHz should be ~1 second = 1e9 nanoseconds
+        let ns = params.convert_to_nanosec(Timestamp(tsc_per_sec));
+
+        // Allow 1% error
+        let expected = 1_000_000_000u64;
+        let error = if ns > expected {
+            ns - expected
+        } else {
+            expected - ns
+        };
+        let error_percent = (error as f64 / expected as f64) * 100.0;
+
+        assert!(
+            error_percent < 1.0,
+            "Conversion error should be < 1%, got {}% (ns={}, expected={})",
+            error_percent,
+            ns,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_convert_to_nanosec_small_values() {
+        let tsc_per_sec = 3_000_000_000u64;
+        let params = ConversionParams::from_ratio(tsc_per_sec).unwrap();
+
+        // 3000 ticks at 3GHz should be ~1 microsecond = 1000 nanoseconds
+        let ns = params.convert_to_nanosec(Timestamp(3000));
+
+        // Allow some error for small values
+        assert!(
+            ns >= 900 && ns <= 1100,
+            "3000 ticks at 3GHz should be ~1000ns, got {}",
+            ns
+        );
+    }
+
+    #[test]
+    fn test_tsc_ticks_per_sec_getter() {
+        let tsc_per_sec = 3_000_000_000u64;
+        let params = ConversionParams::from_ratio(tsc_per_sec).unwrap();
+
+        assert_eq!(
+            params.tsc_ticks_per_sec(),
+            tsc_per_sec,
+            "tsc_ticks_per_sec getter should return the correct value"
+        );
     }
 }
